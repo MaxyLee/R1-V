@@ -14,14 +14,16 @@
 
 import os
 import re
+import torch
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
 
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset, load_from_disk, Image
 from transformers import Qwen2VLForConditionalGeneration
+from torchvision.ops.boxes import box_area
 
-from math_verify import parse, verify
+# from math_verify import parse, verify
 from open_r1.trainer import Qwen2VLGRPOTrainer
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
@@ -33,12 +35,12 @@ class GRPOScriptArguments(ScriptArguments):
 
     Args:
         reward_funcs (`list[str]`):
-            List of reward functions. Possible values: 'accuracy', 'format'.
+            List of reward functions. Possible values: 'iou', 'accuracy', 'format'.
     """
 
     reward_funcs: list[str] = field(
-        default_factory=lambda: ["accuracy", "format"],
-        metadata={"help": "List of reward functions. Possible values: 'accuracy', 'format'"},
+        default_factory=lambda: ["iou", "format"],
+        metadata={"help": "List of reward functions. Possible values: 'iou', 'accuracy', 'format'"},
     )
     max_pixels: Optional[int] = field(
         default=12845056,
@@ -48,7 +50,68 @@ class GRPOScriptArguments(ScriptArguments):
         default=3136,
         metadata={"help": "Minimum number of pixels for the image"},
     )
+    
+bbox_patterns = [
+    re.compile(r'\((\d*?),.*?(\d*?)\),\((\d*?),(\d*?)\)'),
+    re.compile(r'\((.*?),.*?(.*?)\).*?\((.*?),.*?(.*?)\)'),
+    re.compile(r'\[(\d*?), (\d*?), (\d*?), (\d*?)\]'),
+    re.compile(r'\[(.*?), (.*?), (.*?), (.*?)\]'),
+    re.compile(r'\((\d*?), (\d*?), (\d*?), (\d*?)\)'),
+    re.compile(r'\((\d*?), (\d*?)\)\n?.*?\((\d*?), (\d*?)\)')
+]
 
+def box_iou(boxes1, boxes2):
+    area1 = box_area(boxes1)
+    area2 = box_area(boxes2)
+
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])  # [N,M,2]
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # [N,M,2]
+
+    wh = (rb - lt).clamp(min=0)  # [N,M,2]
+    inter = wh[:, :, 0] * wh[:, :, 1]  # [N,M]
+
+    union = area1[:, None] + area2 - inter
+
+    iou = inter / union
+    return iou, union
+
+def get_bbox(ans):
+    for i, pattern in enumerate(bbox_patterns):
+        predict_bbox = re.findall(pattern, ans)
+        if len(predict_bbox) != 0:
+            try:
+                predict_bbox = (float(predict_bbox[-1][0].replace('[', '').replace('x', '')), float(predict_bbox[-1][1]), float(predict_bbox[-1][2]), float(predict_bbox[-1][3]))
+            except:
+                predict_bbox = [0, 0, 0, 0]
+            if sum(predict_bbox) < 4:
+                predict_bbox = [c*1000 for c in predict_bbox]
+            return predict_bbox, i+1
+    
+    return (0., 0., 0., 0.), 0
+
+def iou_reward(completions, solution, **kwargs):
+    contents = [completion[0]["content"] for completion in completions]
+    rewards = []
+    current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
+    for content, sol in zip(contents, solution):
+        reward = 0.0
+            
+        gt_bbox, _ = get_bbox(sol)
+        gt_bbox = torch.tensor(gt_bbox, dtype=torch.float32).view(-1, 4)
+        pred_bbox, _ = get_bbox(content)
+        pred_bbox = torch.tensor(pred_bbox, dtype=torch.float32).view(-1, 4)
+        iou, _ = box_iou(gt_bbox, pred_bbox)
+        reward = iou.item()
+
+        rewards.append(reward)
+        if os.getenv("DEBUG_MODE") == "true":
+            log_path = os.getenv("LOG_PATH")
+            # local_rank = int(os.getenv("LOCAL_RANK", 0))
+            with open(log_path, "a") as f:
+                f.write(f"------------- {current_time} IoU reward: {reward} -------------\n")
+                f.write(f"Content: {content}\n")
+                f.write(f"Solution: {sol}\n")
+    return rewards
 
 def accuracy_reward(completions, solution, **kwargs):
     """Reward function that checks if the completion is correct using either symbolic verification or exact string matching."""
@@ -58,12 +121,12 @@ def accuracy_reward(completions, solution, **kwargs):
     for content, sol in zip(contents, solution):
         reward = 0.0
         # Try symbolic verification first
-        try:
-            answer = parse(content)
-            if float(verify(answer, parse(sol))) > 0:
-                reward = 1.0
-        except Exception:
-            pass  # Continue to next verification method if this fails
+        # try:
+        #     answer = parse(content)
+        #     if float(verify(answer, parse(sol))) > 0:
+        #         reward = 1.0
+        # except Exception:
+        #     pass  # Continue to next verification method if this fails
 
         # If symbolic verification failed, try string matching
         if reward == 0.0:
@@ -98,10 +161,24 @@ def format_reward(completions, **kwargs):
     pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
     completion_contents = [completion[0]["content"] for completion in completions]
     matches = [re.match(pattern, content) for content in completion_contents]
-    return [1.0 if match else 0.0 for match in matches]
+    answer_format_reward = [0.5 if match else 0.0 for match in matches]
+    
+    bbox_format_reward = []
+    for content in completion_contents:
+        _, match_type = get_bbox(content)
+        if match_type == 1:
+            bbox_format_reward.append(0.5)
+        elif match_type == 0:
+            bbox_format_reward.append(0.0)
+        else:
+            bbox_format_reward.append(0.1)
+            
+    reward = [a+b for a,b in zip(answer_format_reward, bbox_format_reward)]
+    return reward
 
 
 reward_funcs_registry = {
+    "iou": iou_reward,
     "accuracy": accuracy_reward,
     "format": format_reward,
 }
@@ -117,10 +194,10 @@ SYSTEM_PROMPT = (
 def main(script_args, training_args, model_args):
     # Get reward functions
     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
-
+    # import ipdb; ipdb.set_trace()
     # Load the dataset
-    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
-
+    # dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    dataset = load_dataset('parquet', data_files=script_args.dataset_name).cast_column("image", Image())
 
     # Format into conversation
     def make_conversation(example):
@@ -130,20 +207,6 @@ def main(script_args, training_args, model_args):
                 {"role": "user", "content": example["problem"]},
             ],
         }
-
-    # def make_conversation_image(example):
-    #     return {
-    #         "prompt": [
-    #             {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
-    #             {
-    #                 "role": "user",
-    #                 "content": [
-    #                     {"type": "image"},
-    #                     {"type": "text", "text": example["problem"]},
-    #                 ],
-    #             },
-    #         ],
-    #     }
 
     QUESTION_TEMPLATE = "{Question}  Output the thinking process in <think> </think> and final answer (number) in <answer> </answer> tags."
 
@@ -173,7 +236,7 @@ def main(script_args, training_args, model_args):
 
     
     trainer_cls = Qwen2VLGRPOTrainer
-
+    
 
     # Initialize the GRPO trainer
     trainer = trainer_cls(
