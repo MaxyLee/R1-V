@@ -27,6 +27,16 @@ from torchvision.ops.boxes import box_area
 from open_r1.trainer import Qwen2VLGRPOTrainer
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
+ds_collections = {
+    'aircraft': '/home/maxinyu/data/oven/grounding/aircraft/concat-random-r1.parquet',
+    'aircraft-f': '/home/maxinyu/data/oven/grounding/aircraft/concat-random-r1-filtered.parquet',
+    'aircraft-f2': '/home/maxinyu/data/oven/grounding/aircraft/concat-random-r1-filtered2.parquet',
+    'car': '/home/maxinyu/data/oven/grounding/car/concat-random-r1.parquet',
+    'dog': '/home/maxinyu/data/oven/grounding/dog/concat-random-r1.parquet',
+    'reptilia': '/home/maxinyu/data/oven/grounding/reptilia/concat-random-r1.parquet',
+    'bird': '/home/maxinyu/data/oven/grounding/bird/concat-random-r1.parquet',
+    'food': '/home/maxinyu/data/oven/grounding/food/concat-random-r1.parquet',
+}
 
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
@@ -51,14 +61,18 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Minimum number of pixels for the image"},
     )
     
+answer_pattern = re.compile(r'<answer>(.*?)</answer>')
 bbox_patterns = [
     re.compile(r'\((\d*?),.*?(\d*?)\),\((\d*?),(\d*?)\)'),
-    re.compile(r'\((.*?),.*?(.*?)\).*?\((.*?),.*?(.*?)\)'),
     re.compile(r'\[(\d*?), (\d*?), (\d*?), (\d*?)\]'),
-    re.compile(r'\[(.*?), (.*?), (.*?), (.*?)\]'),
     re.compile(r'\((\d*?), (\d*?), (\d*?), (\d*?)\)'),
-    re.compile(r'\((\d*?), (\d*?)\)\n?.*?\((\d*?), (\d*?)\)')
+    re.compile(r'\((\d*?), (\d*?)\)\n?.*?\((\d*?), (\d*?)\)'),
 ]
+sensation_pattern = re.compile(r'<sensation>(.*?)</sensation>')
+sensation_bbox_pattern = re.compile(r'\((\d*?),.*?(\d*?)\),\((\d*?),(\d*?)\)')
+bbox_threshold = 0.75
+
+stop_words = ['top left', 'top right', 'bottom left', 'bottom right', ]
 
 def box_iou(boxes1, boxes2):
     area1 = box_area(boxes1)
@@ -83,11 +97,22 @@ def get_bbox(ans):
                 predict_bbox = (float(predict_bbox[-1][0].replace('[', '').replace('x', '')), float(predict_bbox[-1][1]), float(predict_bbox[-1][2]), float(predict_bbox[-1][3]))
             except:
                 predict_bbox = [0, 0, 0, 0]
-            if sum(predict_bbox) < 4:
-                predict_bbox = [c*1000 for c in predict_bbox]
+            # if sum(predict_bbox) < 4:
+            #     predict_bbox = [c*1000 for c in predict_bbox]
             return predict_bbox, i+1
     
     return (0., 0., 0., 0.), 0
+
+def get_sensation_bbox(sen):
+    predict_bbox = re.findall(sensation_pattern, sen)
+    if len(predict_bbox) != 0:
+        try:
+            predict_bbox = (float(predict_bbox[-1][0].replace('[', '').replace('x', '')), float(predict_bbox[-1][1]), float(predict_bbox[-1][2]), float(predict_bbox[-1][3]))
+        except:
+            predict_bbox = [0, 0, 0, 0]
+        return predict_bbox
+    
+    return (0., 0., 0., 0.)
 
 def iou_reward(completions, solution, **kwargs):
     contents = [completion[0]["content"] for completion in completions]
@@ -98,10 +123,41 @@ def iou_reward(completions, solution, **kwargs):
             
         gt_bbox, _ = get_bbox(sol)
         gt_bbox = torch.tensor(gt_bbox, dtype=torch.float32).view(-1, 4)
+        answer = re.findall(answer_pattern, content)
+        if len(answer) > 0:
+            pred_bbox, _ = get_bbox(answer[0])
+            pred_bbox = torch.tensor(pred_bbox, dtype=torch.float32).view(-1, 4)
+            iou, _ = box_iou(gt_bbox, pred_bbox)
+            iou = iou.item()
+            reward = iou if iou > bbox_threshold else 0.0
+
+        rewards.append(reward)
+        if os.getenv("DEBUG_MODE") == "true":
+            log_path = os.getenv("LOG_PATH")
+            # local_rank = int(os.getenv("LOCAL_RANK", 0))
+            with open(log_path, "a") as f:
+                f.write(f"------------- {current_time} IoU reward: {reward} -------------\n")
+                f.write(f"Content: {content}\n")
+                f.write(f"Solution: {sol}\n")
+    return rewards
+
+def sensation_reward(completions, solution, **kwargs):
+    contents = [completion[0]["content"] for completion in completions]
+    rewards = []
+    current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
+    gt_bboxes = kwargs['sensation']
+    for content, gt_bbox in zip(contents, gt_bboxes):
+        reward = 0.0
+
+        gt_bbox = torch.tensor(gt_bbox, dtype=torch.float32).view(-1, 4)
+        
+        match = re.match(sensation_pattern, content)
+        # sensation = 
         pred_bbox, _ = get_bbox(content)
         pred_bbox = torch.tensor(pred_bbox, dtype=torch.float32).view(-1, 4)
         iou, _ = box_iou(gt_bbox, pred_bbox)
-        reward = iou.item()
+        iou = iou.item()
+        reward = iou if iou > 0.75 else 0.0
 
         rewards.append(reward)
         if os.getenv("DEBUG_MODE") == "true":
@@ -149,35 +205,59 @@ def accuracy_reward(completions, solution, **kwargs):
         if os.getenv("DEBUG_MODE") == "true":
             log_path = os.getenv("LOG_PATH")
             # local_rank = int(os.getenv("LOCAL_RANK", 0))
-            with open(log_path, "a") as f:
-                f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
-                f.write(f"Content: {content}\n")
-                f.write(f"Solution: {sol}\n")
+            try:
+                with open(log_path, "a") as f:
+                    f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
+                    f.write(f"Content: {content}\n")
+                    f.write(f"Solution: {sol}\n")
+            except Exception as e:
+                print(e)
+                print(f"------------- {current_time} Accuracy reward: {reward} -------------")
+                print(f"Content: {content}")
+                print(f"Solution: {sol}")
     return rewards
 
 
 def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
-    pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
+    pattern = r"<think>[\S\n\t\v ]*?</think>\s*<answer>.*?</answer>"
+    # pattern = r"<sensation>.*?</sensation><think>[\S\n\t\v ]*?</think>\s*<answer>.*?</answer>"
     completion_contents = [completion[0]["content"] for completion in completions]
     matches = [re.match(pattern, content) for content in completion_contents]
     answer_format_reward = [0.5 if match else 0.0 for match in matches]
     
     bbox_format_reward = []
     for content in completion_contents:
-        _, match_type = get_bbox(content)
-        if match_type == 1:
-            bbox_format_reward.append(0.5)
-        elif match_type == 0:
-            bbox_format_reward.append(0.0)
+        answer = re.findall(answer_pattern, content)
+        if len(answer) > 0:
+            _, match_type = get_bbox(answer[0])
+            if match_type == 1:
+                bbox_format_reward.append(0.5)
+            else:
+                bbox_format_reward.append(0.0)
         else:
-            bbox_format_reward.append(0.1)
+            bbox_format_reward.append(0.0)
             
     reward = [a+b for a,b in zip(answer_format_reward, bbox_format_reward)]
     return reward
 
+def bbox_format_reward(completions, **kwargs):
+    completion_contents = [completion[0]["content"] for completion in completions]
+    
+    bbox_format_reward = []
+    for content in completion_contents:
+        _, match_type = get_bbox(content)
+        if match_type == 1:
+            bbox_format_reward.append(1.0)
+        else:
+            bbox_format_reward.append(0.0)
+        # else:
+        #     bbox_format_reward.append(0.1)
+            
+    return bbox_format_reward
 
 reward_funcs_registry = {
+    "sensation": sensation_reward,
     "iou": iou_reward,
     "accuracy": accuracy_reward,
     "format": format_reward,
@@ -185,19 +265,26 @@ reward_funcs_registry = {
 
 SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
-    "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
-    "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
-    "<think> reasoning process here </think><answer> answer here </answer>"
+    "first briefly describes the visual information that helps answer the question"
+    "then thinks about the reasoning process in the mind and then provides the user with the answer. The visual information, reasoning "
+    "process, and answer are enclosed within <semsation> <sensation>, <think> </think>, and <answer> </answer> tags, respectively, i.e., "
+    "<sensation> visual information here </sensation><think> reasoning process here </think><answer> answer here </answer>"
 )
 
 
 def main(script_args, training_args, model_args):
+    log_path = os.getenv("LOG_PATH")
+    if not os.path.isfile(log_path):
+        with open(log_path, 'w') as f:
+            f.write('\n')
     # Get reward functions
     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
     # import ipdb; ipdb.set_trace()
     # Load the dataset
     # dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
-    dataset = load_dataset('parquet', data_files=script_args.dataset_name).cast_column("image", Image())
+    dataset_names = script_args.dataset_name.split(',')
+    dataset_files = [ds_collections[ds_name] for ds_name in dataset_names]
+    dataset = load_dataset('parquet', data_files=dataset_files).cast_column("image", Image())
 
     # Format into conversation
     def make_conversation(example):
@@ -208,7 +295,7 @@ def main(script_args, training_args, model_args):
             ],
         }
 
-    QUESTION_TEMPLATE = "{Question}  Output the thinking process in <think> </think> and final answer (number) in <answer> </answer> tags."
+    QUESTION_TEMPLATE = "{Question}  Output the thinking process in <think> </think> and final answer (bounding box) in <answer> </answer> tags."
 
     def make_conversation_image(example):
         return {
@@ -223,10 +310,28 @@ def main(script_args, training_args, model_args):
             ],
         }
 
+    R1S_QUESTION_TEMPLATE = "{Question}  Output the sensation process in <sensation> </sensation>, the thinking process in <think> </think>, and final answer in <answer> </answer> tags."
+    
+    def make_conversation_image_sensation(example):
+        return {
+            "prompt": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": R1S_QUESTION_TEMPLATE.format(Question=example["problem"])},
+                    ],
+                },
+            ],
+        }
 
     if "image" in dataset[script_args.dataset_train_split].features:
         print("has image in dataset")
-        dataset = dataset.map(make_conversation_image)  # Utilize multiprocessing for faster mapping
+        if "sensation" in dataset[script_args.dataset_train_split].features:
+            print("has sensation in dataset")
+            dataset = dataset.map(make_conversation_image_sensation)  # Utilize multiprocessing for faster mapping
+        else:
+            dataset = dataset.map(make_conversation_image)  # Utilize multiprocessing for faster mapping
         # dataset = dataset.remove_columns(["original_question", "original_answer"])
 
     else:

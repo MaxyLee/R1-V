@@ -1,14 +1,19 @@
 dt=$(date '+%d_%m_%Y_%H:%M_%S');
 export DEBUG_MODE="true"
-export LOG_PATH="/home/maxinyu/logs/grpo_aircraft_7b.txt"
+RUN_NAME=oven-aircraft-cot-grpo-5
+export LOG_PATH="/home/maxinyu/logs/$RUN_NAME($dt).txt"
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # CUDA_VISIBLE_DEVICES=7
 
-CKPT=/home/maxinyu/ckpt/Qwen2-VL-7B-Instruct
-OUTPUT_DIR=/home/maxinyu/exp/R1-V/Qwen2-VL-7B-Instruct/test
+# CKPT=/home/maxinyu/ckpt/Qwen2-VL-7B-Instruct
+# CKPT=/home/maxinyu/exp/Qwen2-VL/Qwen2-VL-7B-Instruct/oven-aircraft-cot-r1
+CKPT=/home/maxinyu/exp/Qwen2-VL/Qwen2-VL-7B-Instruct/oven-aircraft-cot-r1-slerp
+OUTPUT_DIR=/home/maxinyu/exp/R1-V/Qwen2-VL-7B-Instruct/$RUN_NAME
 
-DATASET=/home/maxinyu/data/oven/grounding/aircraft/concat-random.parquet
+# DATASET=aircraft,car,dog,repptilia,bird,food
+DATASET=aircraft-f2
+
 
 torchrun --nproc_per_node="8" \
     --nnodes="1" \
@@ -29,11 +34,13 @@ torchrun --nproc_per_node="8" \
     --attn_implementation flash_attention_2 \
     --max_pixels 401408 \
     --max_completion_length 512 \
+    --learning_rate 1.0e-6 \
     --num_train_epochs 2 \
-    --run_name Qwen2-VL-7B-aircraft-grounding \
-    --save_steps 1000 \
+    --run_name Qwen2-VL-7B-$RUN_NAME \
+    --save_steps 100 \
     --save_only_model true \
-    --deepspeed local_scripts/zero3.json
+    --deepspeed local_scripts/zero3.json \
+    --num_generations 4
 
 # python src/open_r1/grpo.py \
 #     --output_dir $OUTPUT_DIR \
