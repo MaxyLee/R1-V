@@ -46,7 +46,7 @@ from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_f
 from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 
-from unsloth import FastVisionModel
+# from unsloth import FastVisionModel
 
 import copy
 
@@ -179,8 +179,8 @@ class Qwen2VLGRPOTrainer(Trainer):
                 pass  # torch_dtype is already a torch.dtype or "auto" or None
             elif isinstance(torch_dtype, str):  # it's a str, but not "auto"
                 torch_dtype = getattr(torch, torch_dtype)
-                # model_init_kwargs["torch_dtype"] = torch_dtype
-                model_init_kwargs["dtype"] = torch_dtype
+                model_init_kwargs["torch_dtype"] = torch_dtype
+                # model_init_kwargs["dtype"] = torch_dtype
             else:
                 raise ValueError(
                     "Invalid `torch_dtype` passed to `GRPOConfig`. Expected either 'auto' or a string representing "
@@ -190,11 +190,11 @@ class Qwen2VLGRPOTrainer(Trainer):
             model_init_kwargs["use_cache"] = (
                 False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
             )
-            if "Qwen2-VL" in model_id:
-                # model = Qwen2VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
-                model, processing_class = FastVisionModel.from_pretrained(model, **model_init_kwargs)
-            elif "Qwen2.5-VL" in model_id:
+            if "Qwen2.5-VL" in model_id:
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
+            elif "Qwen2-VL" in model_id:
+                model = Qwen2VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
+                # model, processing_class = FastVisionModel.from_pretrained(model, **model_init_kwargs)
             elif "Aria" in model_id:
                 model_init_kwargs.pop("use_cache")
                 model = AriaForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
@@ -213,10 +213,10 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         # Reference model
         if is_deepspeed_zero3_enabled():
-            if "Qwen2-VL" in model_id:
-                self.ref_model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
-            elif "Qwen2.5-VL" in model_id:
+            if "Qwen2.5-VL" in model_id:
                 self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+            elif "Qwen2-VL" in model_id:
+                self.ref_model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
             elif "Aria" in model_id:
                 self.ref_model = AriaForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
             else:
@@ -290,6 +290,7 @@ class Qwen2VLGRPOTrainer(Trainer):
             pad_token_id=pad_token_id,
         )
         self.beta = args.beta
+        self.cliprange = args.cliprange
 
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
         # input tensor associated with the key "input_ids". However, in GRPO, the sampled data does not include the
@@ -508,6 +509,8 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         # x - x.detach() allows for preserving gradients from x
         per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+        # per_token_loss2 = torch.clamp(torch.exp(per_token_logps - per_token_logps.detach()), 1 - self.cliprange, 1 + self.cliprange) * advantages.unsqueeze(1)
+        # per_token_loss_min = torch.min(per_token_loss1, per_token_loss2, dim=-1)
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
 
