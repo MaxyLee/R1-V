@@ -390,7 +390,6 @@ class Qwen2VLGRPOTrainer(Trainer):
         pixel_values = prompt_inputs["pixel_values"]
         image_grid_thw = prompt_inputs["image_grid_thw"]
 
-        
         if self.max_prompt_length is not None:
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
@@ -447,6 +446,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         image_grid_thw = prompt_inputs["image_grid_thw"].repeat_interleave(self.num_generations, dim=0)
 
         per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw)
+            
         # Get rid of the prompt (-1 because of the shift done in get_per_token_logps)
         per_token_logps = per_token_logps[:, prompt_length - 1 :]
 
@@ -513,6 +513,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         # per_token_loss_min = torch.min(per_token_loss1, per_token_loss2, dim=-1)
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+
 
         # Log the metrics
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
