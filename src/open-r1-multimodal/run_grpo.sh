@@ -5,8 +5,9 @@ RUN_NAME=kvg-grpo
 export LOG_PATH="$RUN_NAME($dt).txt"
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
+CKPT=path/to/stage1-checkpoint
 DATASET=aircraft,car,reptilia,bird,food
-
+OUTPUT_DIR=path/to/output_dir
 
 torchrun --nproc_per_node="8" \
     --nnodes="1" \
